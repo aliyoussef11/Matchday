@@ -57,6 +57,7 @@
     check: '<svg viewBox="0 0 24 24" width="11" height="11" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     cross: '<svg viewBox="0 0 24 24" width="10" height="10" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="3.6" stroke-linecap="round"/></svg>',
     trophy: '<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M8 4h8v5a4 4 0 0 1-8 0zM8 6H5a3 3 0 0 0 3 4M16 6h3a3 3 0 0 1-3 4M12 13v4M8.5 20h7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    trash: '<svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     eye: '<svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="2"/></svg>',
     ball: '<svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true"><circle cx="12" cy="12" r="9.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 7.6l3.4 2.5-1.3 4H9.9l-1.3-4zM12 7.6V2.6M15.4 10.1l4.7-1.6M14.1 14.1l2.9 4M9.9 14.1l-2.9 4M8.6 10.1L3.9 8.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>',
   };
@@ -108,7 +109,7 @@
   const S = {
     date: todayYmd(),
     today: todayYmd(),
-    view: store.get('md:view', 'mine') === 'all' ? 'all' : 'mine',
+    view: ['all', 'live'].includes(store.get('md:view', 'mine')) ? store.get('md:view', 'mine') : 'mine',
     monthOpen: false,
     monthCursor: null,
     expanded: new Set(),
@@ -124,6 +125,12 @@
     sheet: null,
     status: null,
     noTz: false,
+    page: 'main',             // 'main' (matches) or 'slips' (betslips page)
+    predPromises: new Map(),  // fixture id -> promise of its tip loading
+    demoSlips: [],            // sample-data betslips are kept in memory only
+    newSlip: null,
+    slipChecking: null,
+    toastTimer: 0,
   };
 
   // ---------------------------------------------------------------- data shaping
@@ -304,7 +311,7 @@
     return p;
   }
   function setPred(id, p) { memPreds.set(id, p); store.set(`md:p:${id}`, p); }
-  const findFx = (id) => { const d = getDay(S.date); return d ? d.f.find((x) => x.id === id) || null : null; };
+  const findFx = (id, date = S.date) => { const d = getDay(date); return d ? d.f.find((x) => x.id === id) || null : null; };
   function needsPred(fx) {
     const p = getPred(fx);
     if (!p) return true;
@@ -454,11 +461,11 @@
 
   // opts.manual: a tap on one match (goes first). opts.bulk: part of "Get tips" (survives changing day, can be stopped).
   function queuePred(fx, date, opts = {}) {
-    if (S.pending.has(fx.id)) return;
+    if (S.pending.has(fx.id)) return S.predPromises.get(fx.id);
     const manual = !!opts.manual, bulk = !!opts.bulk;
     S.pending.add(fx.id);
     updateRow(fx.id);
-    enqueue({ kind: 'pred', tag: date, manual: manual || bulk, bulk, run: () => apiGet('/predictions', { fixture: fx.id }) }, manual)
+    const pr = enqueue({ kind: 'pred', tag: date, manual: manual || bulk, bulk, run: () => apiGet('/predictions', { fixture: fx.id }) }, manual)
       .then((data) => {
         const r = (data.response || [])[0];
         setPred(fx.id, r ? slimPrediction(r) : { none: true, t: Date.now() });
@@ -470,8 +477,11 @@
         renderProgress();
         if (S.sheet && S.sheet.type === 'match' && S.sheet.id === fx.id) renderSheet();
         if (date === S.date && !queuedFor(date)) renderList(); // refresh the tips bar once everything has arrived
+        S.predPromises.delete(fx.id);
       });
+    S.predPromises.set(fx.id, pr);
     renderProgress();
+    return pr;
   }
   function requestTip(id) {
     const fx = findFx(id);
@@ -601,6 +611,227 @@
   }
   const refreshSheetFor = (id) => { if (S.sheet && S.sheet.type === 'match' && S.sheet.id === id) renderSheet(); };
 
+  // ---------------------------------------------------------------- betslips
+  // A betslip = the N upcoming matches of a day with the most confident tips, each with its best bet (1 / 2 / 1X / X2).
+  const isUpcoming = (fx) => (fx.st === 'NS' || fx.st === 'TBD') && fx.ts * 1000 > Date.now();
+  const getSlips = () => { if (S.demo) return S.demoSlips; const s = store.get('md:slips', []); return Array.isArray(s) ? s : []; };
+  const saveSlips = (list) => { if (S.demo) { S.demoSlips = list.slice(0, 30); return; } store.set('md:slips', list.slice(0, 30)); };
+  function slipCandidates(day, scope) {
+    const mine = new Set(myLeagues());
+    return day.f.filter((fx) => isUpcoming(fx) && (scope === 'all' || mine.has(fx.lg)));
+  }
+  function openSlipSheet() {
+    const day = getDay(S.date);
+    if (!day) return;
+    if (!S.demo && !getKey()) { openSheet({ type: 'settings' }); return; }
+    const prefs = store.get('md:slipPrefs', null) || {};
+    const scope = slipCandidates(day, 'mine').length ? (prefs.scope === 'all' ? 'all' : 'mine') : 'all';
+    openSheet({ type: 'slip', n: Number(prefs.n) || 3, scope });
+  }
+  function slipSheetHTML() {
+    const day = getDay(S.date), sh = S.sheet;
+    if (!day || !sh) return '';
+    const d = parseYmd(S.date);
+    const dayLabel = S.date === S.today ? 'Today' : S.date === addDays(S.today, 1) ? 'Tomorrow' : fmt({ weekday: 'long' }, d);
+    const mineC = slipCandidates(day, 'mine'), allC = slipCandidates(day, 'all');
+    const cands = sh.scope === 'mine' ? mineC : allC;
+    const max = Math.min(20, cands.length);
+    sh.n = Math.max(1, Math.min(sh.n || 3, Math.max(1, max)));
+    const ready = cands.filter((fx) => pickOf(fx, getPred(fx))).length;
+    const missing = cands.filter((fx) => needsPred(fx) && !S.pending.has(fx.id)).length;
+    const lines = [];
+    let canGo = cands.length > 0;
+    if (!cands.length) {
+      lines.push(sh.scope === 'mine' ? 'None of your leagues has an upcoming match on this day. Choose All leagues.' : 'There are no upcoming matches left on this day.');
+    } else {
+      if (!missing) lines.push('Tips are already loaded for these matches, so no requests are needed.');
+      else if (S.demo) lines.push(`${plural(missing, 'tip')} will load first (sample data).`);
+      else {
+        const left = remaining(), room = Math.max(0, left - RESERVE - Q.items.length), load = Math.min(missing, room);
+        const mins = plural(Math.max(1, Math.ceil(load / PER_MIN)), 'minute');
+        if (!room) {
+          lines.push(`You've used today's free requests, so the betslip can only use the ${plural(ready, 'match', 'matches')} that already have tips.`);
+          if (!ready) canGo = false;
+        } else if (load === missing) lines.push(`${plural(missing, 'tip')} will load first: uses ${missing} of your ${left} requests left today, about ${mins}.`);
+        else lines.push(`${plural(missing, 'tip')} are missing, but you only have room for ${load} today (about ${mins}). The betslip will choose from the matches that have tips.`);
+      }
+      lines.push(`Your betslip takes the ${plural(sh.n, 'match', 'matches')} with the most confident tips, each with its best bet.`);
+    }
+    const choice = (scope, title, list) => `<button class="choice" role="radio" aria-checked="${sh.scope === scope}" data-act="slip-scope" data-scope="${scope}"><span class="radio"></span><span><b>${title}</b><span class="s">${plural(list.length, 'upcoming match', 'upcoming matches')}</span></span></button>`;
+    return `<div class="sh-top"><h2 class="sh-title">Generate betslip</h2><button class="close-btn" data-act="close-sheet" aria-label="Close">${ICON.close}</button></div>
+      <p class="pick-intro">${esc(dayLabel)} · ${esc(fmt({ day: 'numeric', month: 'long' }, d))}</p>
+      <div class="set-sec"><h3>How many matches?</h3><div class="set-card">
+        <div class="stepper"><button data-act="slip-minus" aria-label="Fewer matches"${sh.n <= 1 ? ' disabled' : ''}>−</button><output aria-live="polite">${sh.n}</output><button data-act="slip-plus" aria-label="More matches"${sh.n >= max ? ' disabled' : ''}>+</button></div>
+        <p class="stepper-note">${max ? `You can choose up to ${max}` : 'No matches available'}</p>
+      </div></div>
+      <div class="set-sec"><h3>Pick matches from</h3>${choice('mine', 'My leagues', mineC)}${choice('all', 'All leagues', allC)}</div>
+      <div class="slip-info">${lines.map((l) => `<p>${esc(l)}</p>`).join('')}</div>
+      <button class="btn primary" data-act="slip-go"${canGo ? '' : ' disabled'}>Generate betslip</button>`;
+  }
+  async function generateSlip() {
+    const sh = S.sheet;
+    if (!sh || sh.type !== 'slip') return;
+    const date = S.date, day = getDay(date), n = sh.n, scope = sh.scope;
+    if (!day) return;
+    store.set('md:slipPrefs', { n, scope });
+    closeSheet();
+    const cands = slipCandidates(day, scope);
+    if (S.demo) { cands.forEach((fx) => S.demoReq.add(fx.id)); finishSlip(date, n, scope); return; }
+    const missing = cands.filter((fx) => needsPred(fx) && !S.pending.has(fx.id)).sort((a, b) => a.ts - b.ts);
+    const room = Math.max(0, remaining() - RESERVE - Q.items.length);
+    missing.slice(0, room).forEach((fx) => queuePred(fx, date, { bulk: true }));
+    const waits = cands.map((fx) => S.predPromises.get(fx.id)).filter(Boolean);
+    if (waits.length) {
+      setBanner('info', `Preparing your betslip: loading ${plural(waits.length, 'tip')} first. Keep the app open.`, null, 'slip');
+      renderAll();
+      await Promise.allSettled(waits);
+      clearBanner('slip');
+    }
+    finishSlip(date, n, scope);
+  }
+  function finishSlip(date, n, scope) {
+    const day = getDay(date);
+    if (!day) return;
+    const best = slipCandidates(day, scope)
+      .map((fx) => { const p = getPred(fx), pk = pickOf(fx, p); return pk && pk.conf != null ? { fx, pk } : null; })
+      .filter(Boolean)
+      .sort((a, b) => b.pk.conf - a.pk.conf || a.fx.ts - b.fx.ts)
+      .slice(0, n)
+      .sort((a, b) => a.fx.ts - b.fx.ts || a.fx.id - b.fx.id);
+    if (!best.length) { setBanner('error', "Couldn't make a betslip: none of these matches has a tip yet.", null, 'slip'); renderAll(); return; }
+    const slip = {
+      id: `${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`,
+      date, created: Date.now(), scope, want: n,
+      items: best.map(({ fx, pk }) => ({
+        id: fx.id, ts: fx.ts, lg: fx.lg, ln: (day.L[fx.lg] || leagueInfo(fx.lg)).n,
+        h: fx.h, a: fx.a, hid: fx.hid, aid: fx.aid, code: pk.code, conf: pk.conf,
+      })),
+    };
+    saveSlips([slip, ...getSlips()]);
+    S.newSlip = slip.id;
+    goPage('slips');
+    toast('Betslip saved');
+  }
+  function slipItemState(slip, it) {
+    const fx = findFx(it.id, slip.date);
+    if (fx && (FIN.has(fx.st) || OFF.has(fx.st))) it.res = { st: fx.st, gh: fx.gh, ga: fx.ga }; // keep final results with the slip
+    const cur = it.res || (fx ? { st: fx.st, gh: fx.gh, ga: fx.ga, el: fx.el } : { st: 'NS', gh: null, ga: null });
+    return { cur, ok: FIN.has(cur.st) ? judgePick(it.code, cur) : null };
+  }
+  function slipSummary(slip) {
+    const states = slip.items.map((it) => slipItemState(slip, it));
+    const n = slip.items.length;
+    const won = states.filter((s) => s.ok === true).length, lost = states.filter((s) => s.ok === false).length;
+    const voided = states.filter((s) => OFF.has(s.cur.st)).length, live = states.filter((s) => LIVE.has(s.cur.st)).length;
+    const done = won + lost + voided;
+    let cls, label;
+    if (lost) { cls = 'lost'; label = `Lost · ${won} of ${n} right`; }
+    else if (done === n) { cls = 'won'; label = won ? 'Won' : 'Void'; }
+    else if (live) { cls = 'live'; label = `${live} live${won ? ` · ${won} won` : ''}`; }
+    else { cls = 'pending'; label = won ? `${won} of ${n} won · ${n - done} to go` : 'Not started'; }
+    const started = slip.items.some((it, i) => it.ts * 1000 < Date.now() && !FIN.has(states[i].cur.st) && !OFF.has(states[i].cur.st));
+    return { states, cls, label, open: cls === 'pending' || cls === 'live', started };
+  }
+  function slipCardHTML(slip) {
+    const sum = slipSummary(slip), d = parseYmd(slip.date);
+    const chance = slip.items.reduce((p, it) => p * (it.conf / 100), 1) * 100;
+    const rows = slip.items.map((it, i) => {
+      const { cur, ok } = sum.states[i];
+      const st = statusInfo({ st: cur.st, el: cur.el, ts: it.ts });
+      const time = st.kind === 'live' ? `<div class="m-time live"><span class="dot"></span>${esc(st.label)}</div>`
+        : st.kind === 'fin' ? `<div class="m-time fin">${esc(st.label)}<small>${fmtTime(it.ts)}</small></div>`
+          : st.kind === 'off' ? `<div class="m-time"><small>${esc(st.label)}</small></div>` : `<div class="m-time">${esc(st.label)}</div>`;
+      const score = (st.kind === 'fin' || st.kind === 'live') && cur.gh != null ? ` <em class="sl-score">${cur.gh}–${cur.ga}</em>` : '';
+      return `<div class="slip-row" role="button" tabindex="0" data-slip-match="${it.id}" data-slip-date="${slip.date}">${time}
+        <div class="sl-teams"><b>${esc(it.h)} – ${esc(it.a)}${score}</b><span>${esc(it.ln || '')}</span><span class="sl-bet">${esc(pickWords(it.code, it))}</span></div>
+        <span class="pick${ok === true ? ' win' : ok === false ? ' lose' : ''}"><b>${it.code}</b><small>${it.conf}%</small>${ok == null ? '' : `<span class="mark">${ok ? ICON.check : ICON.cross}</span>`}</span></div>`;
+    }).join('');
+    const checking = S.slipChecking === slip.id;
+    const note = slip.items.length < slip.want ? `<p class="slip-note">You asked for ${slip.want} matches, but only ${slip.items.length} had tips.</p>` : '';
+    return `<article class="slip${S.newSlip === slip.id ? ' new' : ''}" id="slip-${slip.id}">
+      <header class="slip-head"><div><b>Betslip · ${esc(fmt({ weekday: 'short', day: 'numeric', month: 'short' }, d))}</b><span class="s">${plural(slip.items.length, 'match', 'matches')} · ${slip.scope === 'mine' ? 'My leagues' : 'All leagues'} · made ${esc(fmt({ hour: '2-digit', minute: '2-digit' }, new Date(slip.created)))}</span></div>
+        <span class="slip-status ${sum.cls}">${esc(sum.label)}</span></header>
+      ${note}${rows}
+      <footer class="slip-foot"><span class="chance">Chance all win (estimate) <b>${chance < 1 ? '&lt;1' : Math.round(chance)}%</b></span>
+        <div class="slip-acts">${sum.started && !S.demo ? `<button data-act="slip-check" data-slip="${slip.id}"${checking ? ' disabled' : ''}>${checking ? 'Updating…' : 'Update results'}</button>` : ''}<button data-act="slip-copy" data-slip="${slip.id}">Copy</button><button class="del" data-act="slip-del" data-slip="${slip.id}" aria-label="Delete betslip">${ICON.trash}</button></div></footer>
+    </article>`;
+  }
+  function renderSlips() {
+    const el = $('#slipsList');
+    if (!el) return;
+    const slips = getSlips();
+    $('#slipsSub').textContent = slips.length ? `${plural(slips.length, 'betslip')} saved on this device` : '';
+    if (!slips.length) {
+      el.innerHTML = `<div class="empty"><b>No betslips yet</b><span>Open a day on the Matches page and tap “Generate betslip”. It will be saved here.</span><br><button class="btn small primary" data-page="main">Go to matches</button></div>`;
+    } else el.innerHTML = slips.map(slipCardHTML).join('');
+    saveSlips(slips); // keeps any final results found while rendering
+    renderBadge();
+  }
+  function renderBadge() {
+    const b = $('#slipBadge');
+    if (!b) return;
+    const open = getSlips().filter((s) => slipSummary(s).open).length;
+    b.textContent = open;
+    b.hidden = !open;
+  }
+  function goPage(p) {
+    S.page = p;
+    $('#app').hidden = p !== 'main';
+    $('#slipsPage').hidden = p !== 'slips';
+    for (const b of document.querySelectorAll('.tabbar [data-page]')) {
+      if (b.dataset.page === p) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+    }
+    window.scrollTo(0, 0);
+    if (p === 'slips') renderSlips(); else { S.newSlip = null; renderAll(); }
+  }
+  function slipText(slip) {
+    const d = parseYmd(slip.date);
+    const lines = slip.items.map((it) => `${fmtTime(it.ts)} ${it.h} vs ${it.a}: ${it.code} (${pickWords(it.code, it)}) ${it.conf}%`);
+    const chance = slip.items.reduce((p, it) => p * (it.conf / 100), 1) * 100;
+    return `Betslip, ${fmt({ weekday: 'short', day: 'numeric', month: 'short' }, d)}\n${lines.join('\n')}\nChance all win (estimate): ${chance < 1 ? '<1' : Math.round(chance)}%`;
+  }
+  async function copySlip(id) {
+    const slip = getSlips().find((s) => s.id === id);
+    if (!slip) return;
+    const text = slipText(slip);
+    try { await navigator.clipboard.writeText(text); toast('Copied'); } catch { toast(legacyCopy(text) ? 'Copied' : "Couldn't copy on this device"); }
+  }
+  function legacyCopy(text) { // fallback for browsers without the async clipboard
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;font-size:16px';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { ok = false; }
+    ta.remove();
+    return ok;
+  }
+  async function checkSlip(id) {
+    const slip = getSlips().find((s) => s.id === id);
+    if (!slip || S.demo || !getKey()) return;
+    S.slipChecking = id;
+    renderSlips();
+    try { await fetchDay(slip.date); toast('Results updated'); } catch (e) { onApiError(e); toast(e.kind === 'quota' ? 'No free requests left today' : "Couldn't update results"); }
+    S.slipChecking = null;
+    renderSlips();
+  }
+  function deleteSlip(id) {
+    if (!window.confirm('Delete this betslip?')) return;
+    saveSlips(getSlips().filter((s) => s.id !== id));
+    renderSlips();
+  }
+  function toast(msg) {
+    const t = $('#toast');
+    if (!t) return;
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(S.toastTimer);
+    S.toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+  }
+
   async function refreshStatus() {
     if (S.demo || !getKey()) return null;
     try {
@@ -667,7 +898,11 @@
     const mine = new Set(myLeagues());
     $('#nMine').textContent = day ? day.f.filter((x) => mine.has(x.lg)).length : '';
     $('#nAll').textContent = day ? day.f.length : '';
+    const todayDay = getDay(S.today), nLive = todayDay ? todayDay.f.filter((x) => LIVE.has(x.st)).length : 0;
+    $('#nLive').textContent = todayDay ? nLive : '';
+    $('#liveDot').classList.toggle('on', nLive > 0);
     $('#searchWrap').hidden = welcome || S.view !== 'all';
+    $('#slipBtn').hidden = welcome || !day || !day.f.some(isUpcoming);
   }
   function renderBanner() {
     const el = $('#banner');
@@ -695,6 +930,7 @@
     for (const fx of day.f) {
       const inMine = mine.has(fx.lg);
       if (S.view === 'mine' && !inMine) continue;
+      if (S.view === 'live' && !LIVE.has(fx.st)) continue;
       if (q && S.view === 'all') {
         const L = day.L[fx.lg] || {};
         if (!norm(`${fx.h} ${fx.a} ${L.n || ''} ${L.c || ''} ${countryLabel(L.c)}`).includes(q)) continue;
@@ -819,6 +1055,14 @@
     }
     return h;
   }
+  function liveBarHTML(day) {
+    const n = day.f.filter((fx) => LIVE.has(fx.st)).length;
+    const busy = S.loadingDay === S.date;
+    const upd = fmt({ hour: '2-digit', minute: '2-digit' }, new Date(day.t || Date.now()));
+    const sub = busy ? 'Updating scores…' : `Scores as of ${upd}${S.demo ? '' : ' · Refresh uses 1 request'}`;
+    return `<div class="tipsbar livebar"><span class="ldot${n ? ' on' : ''}"></span><div class="tb-text"><b>${n ? `${plural(n, 'match', 'matches')} live now` : 'Live now'}</b><span>${esc(sub)}</span></div>
+      <div class="tb-btns"><button class="btn small" data-act="refresh"${busy ? ' disabled' : ''}>Refresh</button></div></div>`;
+  }
   function renderList() {
     const el = $('#list');
     if (!S.demo && !getKey()) { el.innerHTML = welcomeHTML(); return; }
@@ -829,9 +1073,12 @@
       return;
     }
     const groups = groupsFor(day);
-    let html = noticesHTML(day);
+    let html = S.view === 'live' ? liveBarHTML(day) : noticesHTML(day);
     if (!groups.length) {
-      if (S.view === 'mine') {
+      if (S.view === 'live') {
+        const next = day.f.filter((fx) => fx.st === 'NS' && fx.ts * 1000 > Date.now()).sort((a, b) => a.ts - b.ts)[0];
+        html += emptyHTML('No live matches right now', next ? `Next kick-off at ${fmtTime(next.ts)}: ${next.h} vs ${next.a}.` : 'There are no more matches today.');
+      } else if (S.view === 'mine') {
         html += day.f.length
           ? emptyHTML('No matches in your leagues', `There ${day.f.length === 1 ? 'is 1 other match' : `are ${day.f.length} other matches`} on this day.`, { label: 'Show all matches', act: 'show-all' })
           : emptyHTML('No matches on this day');
@@ -845,6 +1092,7 @@
     renderBanner();
     renderProgress();
     renderList();
+    renderBadge();
   }
 
   // ---------------------------------------------------------------- sheets (match details, settings)
@@ -870,15 +1118,17 @@
     const body = $('#sheetBody');
     if (S.sheet.type === 'settings') body.innerHTML = settingsHTML();
     else if (S.sheet.type === 'leagues') body.innerHTML = pickerHTML();
+    else if (S.sheet.type === 'slip') body.innerHTML = slipSheetHTML();
     else {
-      const fx = findFx(S.sheet.id);
+      const date = S.sheet.date || S.date;
+      const fx = findFx(S.sheet.id, date);
       if (!fx) { closeSheet(); return; }
-      body.innerHTML = matchHTML(fx);
+      body.innerHTML = matchHTML(fx, date);
     }
   }
   const CMP_LABELS = { form: 'Form', att: 'Attack', def: 'Defence', poisson_distribution: 'Goal model', h2h: 'Head to head', goals: 'Goals', total: 'Overall' };
-  function matchHTML(fx) {
-    const day = getDay(S.date) || { L: {} }, L = day.L[fx.lg] || leagueInfo(fx.lg);
+  function matchHTML(fx, date = S.date) {
+    const day = getDay(date) || { L: {} }, L = day.L[fx.lg] || leagueInfo(fx.lg);
     const p = getPred(fx), st = statusInfo(fx), pk = pickOf(fx, p), ou = parseOU(p && p.uo);
     const showScore = (st.kind === 'fin' || st.kind === 'live') && fx.gh != null;
     const when = fmt({ weekday: 'short', day: 'numeric', month: 'short' }, new Date(fx.ts * 1000));
@@ -971,7 +1221,7 @@
 
       <div class="set-sec"><h3>My leagues</h3><div class="set-card">
         ${leagues.length ? leagues.map((id) => { const i = leagueInfo(id); return `<div class="row-line"><span>${esc(i.n)}<small>${esc(countryLabel(i.c))}</small></span><button class="rm" data-remove-league="${id}" aria-label="Remove ${esc(i.n)}">${ICON.close}</button></div>`; }).join('') : '<p>No leagues yet.</p>'}
-        <p style="margin-top:10px">These leagues fill the “My leagues” tab, and the “My leagues” button in Get tips ticks them in one go. To add one, open “All matches” and tap its ☆.</p>
+        <p style="margin-top:10px">These leagues fill the “My leagues” tab, and the “My leagues” button in Get tips ticks them in one go. To add one, open the “All” tab and tap its ☆.</p>
         ${JSON.stringify(leagues) !== JSON.stringify(DEFAULT_LEAGUES) ? '<button class="btn" data-act="reset-leagues" style="margin-top:4px">Reset to the main leagues</button>' : ''}
       </div></div>
 
@@ -1001,6 +1251,7 @@
   // ---------------------------------------------------------------- actions
   function selectDate(ds) {
     S.monthOpen = false;
+    if (S.view === 'live' && ds !== S.today) { S.view = 'all'; store.set('md:view', 'all'); } // live only exists today
     if (ds !== S.date) {
       S.date = ds;
       S.query = '';
@@ -1014,10 +1265,24 @@
     S.dayTimer = setTimeout(() => loadDay(ds), 250);
   }
   function setView(v) {
-    if (v === S.view) return;
+    if (v === 'live' && S.date !== S.today) {
+      S.date = S.today;
+      S.query = '';
+      const s = $('#search'); if (s) s.value = '';
+    }
+    if (v === S.view && v !== 'live') return;
     S.view = v;
     store.set('md:view', v);
+    window.scrollTo(0, 0);
     renderAll();
+    if (v === 'live') refreshLive();
+  }
+  // Live scores update when the Live tab is opened (if more than a minute old) or on Refresh, never on a timer.
+  function refreshLive() {
+    if (S.demo) { demoDays.clear(); renderAll(); return; }
+    if (!getKey()) return;
+    const day = getDay(S.today);
+    if (!day || Date.now() - (day.t || 0) > 60e3) loadDay(S.today, true);
   }
   function toggleStar(id) {
     const list = myLeagues(), i = list.indexOf(id);
@@ -1090,6 +1355,10 @@
       store.set('md:leagues', myLeagues().filter((x) => x !== id));
       renderSheet(); renderAll(); return;
     }
+    const pageBtn = t.closest('[data-page]');
+    if (pageBtn) { goPage(pageBtn.dataset.page); return; }
+    const slipRow = t.closest('[data-slip-match]');
+    if (slipRow) { openSheet({ type: 'match', id: Number(slipRow.dataset.slipMatch), date: slipRow.dataset.slipDate }); return; }
     const dateBtn = t.closest('[data-date]');
     if (dateBtn) { selectDate(dateBtn.dataset.date); return; }
     const shift = t.closest('[data-shift]');
@@ -1115,6 +1384,13 @@
       else if (a === 'pick-none') pickSet('none');
       else if (a === 'pick-go') startPicked();
       else if (a === 'stop-tips') stopTips();
+      else if (a === 'slip-open') openSlipSheet();
+      else if (a === 'slip-minus' || a === 'slip-plus') { if (S.sheet && S.sheet.type === 'slip') { S.sheet.n += a === 'slip-plus' ? 1 : -1; renderSheet(); } }
+      else if (a === 'slip-scope') { if (S.sheet && S.sheet.type === 'slip') { S.sheet.scope = act.dataset.scope; renderSheet(); } }
+      else if (a === 'slip-go') generateSlip();
+      else if (a === 'slip-copy') copySlip(act.dataset.slip);
+      else if (a === 'slip-check') checkSlip(act.dataset.slip);
+      else if (a === 'slip-del') deleteSlip(act.dataset.slip);
       else if (a === 'save-key') saveKey();
       else if (a === 'test-key') testKey();
       else if (a === 'clear-data') clearData();
@@ -1185,9 +1461,9 @@
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) return;
       const t = todayYmd();
-      if (t !== S.today) S.today = t;
+      if (t !== S.today) { S.today = t; if (S.view === 'live') S.date = t; }
       renderAll();
-      loadDay(S.date);
+      if (S.view === 'live') refreshLive(); else loadDay(S.date);
     });
     window.addEventListener('online', () => { clearBanner('net'); loadDay(S.date); });
     window.addEventListener('offline', () => setBanner('info', "You're offline. Showing saved data.", null, 'net'));
@@ -1197,7 +1473,7 @@
     prune();
     bind();
     renderAll();
-    loadDay(S.date);
+    if (S.view === 'live') refreshLive(); else loadDay(S.date);
     // The account check costs 1 request, so only sync the usage counter every few hours
     // (it also picks up requests made from another device with the same key).
     if (getKey() && !S.demo && Date.now() - (Number(store.get('md:statusAt', 0)) || 0) > 3 * 3600e3) refreshStatus();
