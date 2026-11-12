@@ -204,9 +204,30 @@ main { padding: 16px 16px calc(env(safe-area-inset-bottom) + 28px); }
 .tipsbar .tb-text b { font-size: 14.5px; font-variant-numeric: tabular-nums; }
 .tipsbar .tb-text span { font-size: 12.5px; color: var(--muted); }
 .tipsbar .tb-btns { display: flex; gap: 8px; flex: none; }
-.tipsbar.two { flex-wrap: wrap; }
-.tipsbar.two .tb-btns { width: 100%; }
-.tipsbar.two .tb-btns .btn { flex: 1; }
+/* league picker (Get tips) */
+.pick-intro { margin: 2px 0 12px; color: var(--muted); font-size: 14px; }
+.pick-tools { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.pick-tools button {
+  height: 32px; padding: 0 13px; border-radius: 999px; border: 1px solid var(--line-strong);
+  background: transparent; color: var(--text); font-size: 13px; font-weight: 650;
+}
+.pick-search { background: var(--surface-2); border-color: transparent; }
+.lg-pick { position: relative; display: flex; align-items: center; gap: 10px; padding: 10px 2px; border-top: 1px solid var(--line); cursor: pointer; }
+.lg-pick:first-child { border-top: 0; }
+.lg-pick input { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+.lg-pick .tick {
+  width: 24px; height: 24px; flex: none; border-radius: 7px; border: 2px solid var(--line-strong);
+  display: grid; place-items: center; color: transparent; transition: background .15s ease, border-color .15s ease;
+}
+.lg-pick input:checked + .tick { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.lg-pick input:focus-visible + .tick { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pick-empty { text-align: center; color: var(--muted); padding: 24px 0; margin: 0; }
+.pick-foot {
+  position: sticky; bottom: 0; z-index: 1; margin: 8px -18px 0; padding: 12px 18px 14px;
+  background: var(--surface); border-top: 1px solid var(--line);
+}
+.pick-foot p { margin: 0 0 10px; font-size: 13.5px; color: var(--muted); }
+.btn:disabled { opacity: .45; cursor: default; }
 .p-stop {
   margin-left: 4px; padding: 3px 11px; border-radius: 999px; border: 1px solid currentColor;
   background: transparent; color: inherit; font-size: 12.5px; font-weight: 750;

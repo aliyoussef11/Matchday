@@ -297,7 +297,7 @@
   const hasDay = (date) => (S.demo ? true : memDays.has(date) || store.has(dayKey(date)));
   function getPred(fx) {
     if (!fx) return null;
-    if (S.demo) return myLeagues().includes(fx.lg) || S.demoReq.has(fx.id) ? demoPrediction(fx) : null;
+    if (S.demo) return S.demoReq.has(fx.id) ? demoPrediction(fx) : null;
     if (memPreds.has(fx.id)) return memPreds.get(fx.id);
     const p = store.get(`md:p:${fx.id}`, null);
     if (p) memPreds.set(fx.id, p);
@@ -449,27 +449,10 @@
       if (S.loadingDay === date) S.loadingDay = null;
     }
     if (date !== S.date) return;
-    renderAll();
-    scheduleTips(date);
+    renderAll(); // tips never load by themselves: only from "Get tips", a "Tip" tap, or opening a match
   }
 
-  function scheduleTips(date, all = false) {
-    if (S.demo || !getKey()) return;
-    const day = getDay(date);
-    if (!day) return;
-    if (date < S.today && !all) { renderList(); return; }
-    const mine = new Set(myLeagues());
-    const need = day.f
-      .filter((fx) => mine.has(fx.lg) && !OFF.has(fx.st) && !S.pending.has(fx.id) && needsPred(fx))
-      .sort((a, b) => a.ts - b.ts || a.id - b.id);
-    const room = Math.max(0, remaining() - RESERVE - Q.items.length);
-    const take = need.slice(0, room);
-    S.held[date] = need.length - take.length;
-    take.forEach((fx) => queuePred(fx, date));
-    renderProgress();
-    if (take.length || S.held[date]) renderList();
-  }
-  // opts.manual: a tap on one match (goes first). opts.bulk: part of "Get all tips" (survives changing day, can be stopped).
+  // opts.manual: a tap on one match (goes first). opts.bulk: part of "Get tips" (survives changing day, can be stopped).
   function queuePred(fx, date, opts = {}) {
     if (S.pending.has(fx.id)) return;
     const manual = !!opts.manual, bulk = !!opts.bulk;
@@ -503,39 +486,114 @@
     queuePred(fx, S.date, { manual: true });
     refreshSheetFor(id);
   }
-  // "Get all tips": every match of the selected day, as far as today's free requests allow.
-  function getAllTips(onlyMine = false) {
-    const date = S.date, day = getDay(date);
-    if (!day) return;
-    const mine = new Set(myLeagues());
-    const need = day.f
-      .filter((fx) => (!onlyMine || mine.has(fx.lg)) && !OFF.has(fx.st) && !S.pending.has(fx.id) && needsPred(fx))
-      .sort((a, b) => (mine.has(b.lg) - mine.has(a.lg)) || (FIN.has(a.st) - FIN.has(b.st)) || a.ts - b.ts || a.id - b.id);
-    if (!need.length) return;
-    if (S.demo) {
-      need.forEach((fx) => S.demoReq.add(fx.id));
-      if (!onlyMine) expandAll(day);
-      renderAll();
-      return;
-    }
-    if (!getKey()) { openSheet({ type: 'settings' }); return; }
-    const left = remaining(), room = Math.max(0, left - RESERVE - Q.items.length);
-    if (!room) { onApiError(new ApiError('quota', '')); return; }
-    const take = need.slice(0, room);
-    const mins = plural(Math.max(1, Math.ceil(take.length / PER_MIN)), 'minute');
-    const msg = take.length === need.length
-      ? `Get tips for ${plural(take.length, 'match', 'matches')}?\n\nThis uses ${take.length} of your ${left} free requests left today and takes about ${mins}. Keep the app open while they load.`
-      : `You have ${left} free requests left today: enough for ${take.length} of these ${need.length} matches (${RESERVE} are kept spare).\n\nGet those ${take.length} now? Your leagues and the earliest matches go first. It takes about ${mins}. Keep the app open while they load.`;
-    if (!window.confirm(msg)) return;
-    S.held[date] = need.length - take.length;
-    take.forEach((fx) => queuePred(fx, date, { bulk: true }));
-    if (!onlyMine) expandAll(day);
-    renderAll();
+  // ---- "Get tips": choose the day's leagues, then load tips for their matches (as far as today's requests allow)
+  const tipCandidates = (day) => day.f.filter((fx) => !OFF.has(fx.st) && !S.pending.has(fx.id) && needsPred(fx));
+  function leagueOrder(day, ids) {
+    const mineList = myLeagues(), mine = new Set(mineList);
+    const cKey = (id) => { const c = (day.L[id] || leagueInfo(id)).c; return !c || c === 'World' ? ' ' : c; };
+    return ids.slice().sort((a, b) => {
+      const am = mine.has(a), bm = mine.has(b);
+      if (am !== bm) return am ? -1 : 1;
+      if (am) return mineList.indexOf(a) - mineList.indexOf(b);
+      return cKey(a).localeCompare(cKey(b)) || a - b;
+    });
   }
-  function expandAll(day) {
+  function openPicker() {
+    const day = getDay(S.date);
+    if (!day) return;
+    if (!S.demo && !getKey()) { openSheet({ type: 'settings' }); return; }
+    const avail = new Set(tipCandidates(day).map((fx) => fx.lg));
+    const last = store.get('md:pickLast', null);
+    const base = Array.isArray(last) && last.some((id) => avail.has(id)) ? last : myLeagues();
+    openSheet({ type: 'leagues', sel: new Set(base.filter((id) => avail.has(id))), q: '' });
+  }
+  function pickCounts(day) {
+    const counts = new Map();
+    for (const fx of tipCandidates(day)) counts.set(fx.lg, (counts.get(fx.lg) || 0) + 1);
+    return counts;
+  }
+  function pickVisibleIds(day) {
+    const q = norm((S.sheet && S.sheet.q || '').trim());
+    const ids = leagueOrder(day, [...pickCounts(day).keys()]);
+    if (!q) return ids;
+    return ids.filter((id) => { const L = day.L[id] || leagueInfo(id); return norm(`${L.n} ${L.c} ${countryLabel(L.c)}`).includes(q); });
+  }
+  function pickListHTML() {
+    const day = getDay(S.date);
+    if (!day || !S.sheet) return '';
+    const counts = pickCounts(day), mine = new Set(myLeagues()), ids = pickVisibleIds(day);
+    if (!counts.size) return '<p class="pick-empty">All tips for this day are already loaded.</p>';
+    if (!ids.length) return '<p class="pick-empty">No league matches your search.</p>';
+    return ids.map((id) => {
+      const L = day.L[id] || leagueInfo(id), n = counts.get(id);
+      return `<label class="lg-pick"><input type="checkbox" data-pick="${id}"${S.sheet.sel.has(id) ? ' checked' : ''}><span class="tick">${ICON.check}</span>${leagueLogoHTML(L)}
+        <div class="lg-name"><b>${esc(L.n)}</b><span>${esc(countryLabel(L.c))}${mine.has(id) ? ' · ★ My league' : ''}</span></div><span class="lg-count">${n}</span></label>`;
+    }).join('');
+  }
+  function pickFootHTML() {
+    const day = getDay(S.date);
+    if (!day || !S.sheet) return '';
+    const sel = S.sheet.sel;
+    const n = tipCandidates(day).filter((fx) => sel.has(fx.lg)).length;
+    const leagues = [...sel].filter((id) => pickCounts(day).has(id)).length;
+    let text, take = n;
+    if (!n) text = 'Tick the leagues you want tips for.';
+    else if (S.demo) text = `${plural(leagues, 'league')} · ${plural(n, 'match', 'matches')} (sample data)`;
+    else {
+      const left = remaining(), room = Math.max(0, left - RESERVE - Q.items.length);
+      take = Math.min(n, room);
+      const mins = Math.max(1, Math.ceil(take / PER_MIN));
+      if (!room) text = `You've used today's free requests. More from ${resetTimeText()}.`;
+      else if (take === n) text = `${plural(leagues, 'league')} · ${plural(n, 'match', 'matches')} · uses ${n} of your ${left} requests left · about ${plural(mins, 'minute')}`;
+      else text = `${plural(n, 'match', 'matches')} chosen, but only ${take} fit in the ${left} requests you have left today (${RESERVE} kept spare). The earliest matches go first.`;
+    }
+    return `<p>${esc(text)}</p><button class="btn primary" data-act="pick-go"${take ? '' : ' disabled'}>${take ? `Get ${plural(take, 'tip')}` : 'Get tips'}</button>`;
+  }
+  function pickerHTML() {
+    const d = parseYmd(S.date);
+    const label = S.date === S.today ? 'today' : fmt({ weekday: 'long', day: 'numeric', month: 'long' }, d);
+    return `<div class="sh-top"><h2 class="sh-title">Get tips</h2><button class="close-btn" data-act="close-sheet" aria-label="Close">${ICON.close}</button></div>
+      <p class="pick-intro">Choose the leagues to load tips for ${esc(label)}. Each match uses 1 request.</p>
+      <div class="pick-tools"><button data-act="pick-all">Select all</button><button data-act="pick-mine">My leagues</button><button data-act="pick-none">Clear</button></div>
+      <div class="search pick-search"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M20 20l-3.5-3.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg><input id="pickSearch" type="search" placeholder="Search league or country" autocomplete="off" autocorrect="off" spellcheck="false" value="${esc(S.sheet.q || '')}"></div>
+      <div id="pickList">${pickListHTML()}</div>
+      <div class="pick-foot" id="pickFoot">${pickFootHTML()}</div>`;
+  }
+  function refreshPicker(list = true) {
+    if (!S.sheet || S.sheet.type !== 'leagues') return;
+    if (list) { const l = $('#pickList'); if (l) l.innerHTML = pickListHTML(); }
+    const f = $('#pickFoot'); if (f) f.innerHTML = pickFootHTML();
+  }
+  function pickSet(mode) {
+    const day = getDay(S.date);
+    if (!day || !S.sheet) return;
+    const avail = new Set(pickCounts(day).keys());
+    if (mode === 'all') pickVisibleIds(day).forEach((id) => S.sheet.sel.add(id));
+    else if (mode === 'mine') S.sheet.sel = new Set(myLeagues().filter((id) => avail.has(id)));
+    else S.sheet.sel = new Set();
+    refreshPicker();
+  }
+  function startPicked() {
+    if (!S.sheet || S.sheet.type !== 'leagues') return;
+    const date = S.date, day = getDay(date);
+    const sel = new Set(S.sheet.sel);
+    if (!day || !sel.size) return;
+    const need = tipCandidates(day).filter((fx) => sel.has(fx.lg))
+      .sort((a, b) => (FIN.has(a.st) - FIN.has(b.st)) || a.ts - b.ts || a.id - b.id);
+    if (!need.length) return;
+    store.set('md:pickLast', [...sel]);
+    closeSheet();
     S.view = 'all';
     store.set('md:view', 'all');
-    for (const fx of day.f) S.expanded.add(fx.lg);
+    S.expanded = new Set(sel);
+    window.scrollTo(0, 0);
+    if (S.demo) { need.forEach((fx) => S.demoReq.add(fx.id)); renderAll(); return; }
+    const room = Math.max(0, remaining() - RESERVE - Q.items.length);
+    if (!room) { onApiError(new ApiError('quota', '')); renderAll(); return; }
+    const take = need.slice(0, room);
+    S.held[date] = need.length - take.length;
+    take.forEach((fx) => queuePred(fx, date, { bulk: true }));
+    renderAll();
   }
   function stopTips() {
     dropQueued((j) => j.bulk);
@@ -724,7 +782,7 @@
       return `<div class="welcome">
         <div class="w-icon">${ICON.ball}</div>
         <h2>One tap to start</h2>
-        <p>Your API-Football key is already filled in. Open Settings and tap <b>Save</b>, and today's matches and tips will load.</p>
+        <p>Your API-Football key is already filled in. Open Settings and tap <b>Save</b>, and today's matches will load. Then tap <b>Get tips</b> and choose your leagues.</p>
         <button class="btn primary" data-act="settings">Open Settings</button>
         <button class="btn" data-act="demo-on">Look around with sample matches</button>
       </div>`;
@@ -748,13 +806,8 @@
     if (!live.length || queuedFor(S.date)) return '';
     const missing = live.filter((fx) => !getPred(fx) && !S.pending.has(fx.id));
     if (!missing.length) return '';
-    const mine = new Set(myLeagues());
-    const mineMissing = missing.filter((fx) => mine.has(fx.lg)).length;
-    const past = S.date < S.today;
-    const two = past && mineMissing > 0 && mineMissing < missing.length;
-    const sub = past ? 'Past days load tips only when you ask.' : 'Tips for your leagues load by themselves.';
-    return `<div class="tipsbar${two ? ' two' : ''}"><div class="tb-text"><b>Tips for ${live.length - missing.length} of ${plural(live.length, 'match', 'matches')}</b><span>${sub}</span></div>
-      <div class="tb-btns">${two ? `<button class="btn small" data-act="past-tips">My leagues (${mineMissing})</button>` : ''}<button class="btn small primary" data-act="all-tips">Get all tips</button></div></div>`;
+    return `<div class="tipsbar"><div class="tb-text"><b>Tips for ${live.length - missing.length} of ${plural(live.length, 'match', 'matches')}</b><span>Choose the leagues you want tips for.</span></div>
+      <div class="tb-btns"><button class="btn small primary" data-act="pick-open">Get tips</button></div></div>`;
   }
   function noticesHTML(day) {
     if (!S.demo && !getKey()) return '';
@@ -762,7 +815,7 @@
     if (S.demo) return h;
     const held = S.held[S.date] || 0;
     if (held && !queuedFor(S.date)) {
-      h += `<div class="notice warn"><div><b>${plural(held, 'tip')} not loaded</b><span>That keeps you inside today's free limit. Tap “Tip” on a match, remove leagues in Settings, or check back after ${resetTimeText()}.</span></div></div>`;
+      h += `<div class="notice warn"><div><b>${plural(held, 'tip')} not loaded</b><span>That keeps you inside today's free limit. Tap “Tip” on a match you care about, or try again after ${resetTimeText()}.</span></div></div>`;
     }
     return h;
   }
@@ -816,6 +869,7 @@
     if (!S.sheet) return;
     const body = $('#sheetBody');
     if (S.sheet.type === 'settings') body.innerHTML = settingsHTML();
+    else if (S.sheet.type === 'leagues') body.innerHTML = pickerHTML();
     else {
       const fx = findFx(S.sheet.id);
       if (!fx) { closeSheet(); return; }
@@ -917,7 +971,7 @@
 
       <div class="set-sec"><h3>My leagues</h3><div class="set-card">
         ${leagues.length ? leagues.map((id) => { const i = leagueInfo(id); return `<div class="row-line"><span>${esc(i.n)}<small>${esc(countryLabel(i.c))}</small></span><button class="rm" data-remove-league="${id}" aria-label="Remove ${esc(i.n)}">${ICON.close}</button></div>`; }).join('') : '<p>No leagues yet.</p>'}
-        <p style="margin-top:10px">Tips load by themselves for these leagues. To add one, open “All matches” and tap its ☆.</p>
+        <p style="margin-top:10px">These leagues fill the “My leagues” tab, and the “My leagues” button in Get tips ticks them in one go. To add one, open “All matches” and tap its ☆.</p>
         ${JSON.stringify(leagues) !== JSON.stringify(DEFAULT_LEAGUES) ? '<button class="btn" data-act="reset-leagues" style="margin-top:4px">Reset to the main leagues</button>' : ''}
       </div></div>
 
@@ -975,7 +1029,6 @@
     }
     store.set('md:leagues', list);
     renderAll();
-    if (i < 0) scheduleTips(S.date);
   }
   function toggleGroup(id) {
     if (S.expanded.has(id)) S.expanded.delete(id); else S.expanded.add(id);
@@ -1056,13 +1109,16 @@
       else if (a === 'demo-on') setDemo(true);
       else if (a === 'show-all') setView('all');
       else if (a === 'refresh') refresh();
-      else if (a === 'past-tips') { if (S.demo) getAllTips(true); else scheduleTips(S.date, true); }
-      else if (a === 'all-tips') getAllTips();
+      else if (a === 'pick-open') openPicker();
+      else if (a === 'pick-all') pickSet('all');
+      else if (a === 'pick-mine') pickSet('mine');
+      else if (a === 'pick-none') pickSet('none');
+      else if (a === 'pick-go') startPicked();
       else if (a === 'stop-tips') stopTips();
       else if (a === 'save-key') saveKey();
       else if (a === 'test-key') testKey();
       else if (a === 'clear-data') clearData();
-      else if (a === 'reset-leagues') { store.del('md:leagues'); renderSheet(); renderAll(); scheduleTips(S.date); }
+      else if (a === 'reset-leagues') { store.del('md:leagues'); renderSheet(); renderAll(); }
       else if (a === 'toggle-key') { const i = $('#keyInput'); if (i) i.type = i.type === 'password' ? 'text' : 'password'; }
       return;
     }
@@ -1089,7 +1145,19 @@
       if (e.key === 'Escape') { if (S.sheet) closeSheet(); else if (S.monthOpen) { S.monthOpen = false; renderHeader(); } return; }
       if ((e.key === 'Enter' || e.key === ' ') && e.target.matches && e.target.matches('[role="button"]')) { e.preventDefault(); e.target.click(); }
     });
-    document.addEventListener('change', (e) => { if (e.target && e.target.id === 'demoToggle') setDemo(e.target.checked); });
+    document.addEventListener('change', (e) => {
+      const t = e.target;
+      if (!t) return;
+      if (t.id === 'demoToggle') { setDemo(t.checked); return; }
+      if (t.dataset && t.dataset.pick && S.sheet && S.sheet.type === 'leagues') {
+        const id = Number(t.dataset.pick);
+        if (t.checked) S.sheet.sel.add(id); else S.sheet.sel.delete(id);
+        refreshPicker(false);
+      }
+    });
+    document.addEventListener('input', (e) => {
+      if (e.target && e.target.id === 'pickSearch' && S.sheet && S.sheet.type === 'leagues') { S.sheet.q = e.target.value; refreshPicker(); }
+    });
     // broken logo -> initials badge
     document.addEventListener('error', (e) => {
       const img = e.target;
